@@ -6,8 +6,10 @@ import json
 from functools import lru_cache
 import requests
 import time
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 import os
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy import create_engine, Column, Integer, String, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -24,8 +26,6 @@ import matplotlib.font_manager as fm
 import textwrap
 import matplotlib.colors as mcolors
 import numpy as np
-from fastapi import FastAPI, Response
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from docx import Document
 import io
@@ -41,7 +41,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["GET, POST"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"]
 )
 
@@ -52,7 +52,7 @@ questions_all = get_all_questions()
 
 cache = {}
 
-# Можели FastAPI
+# Модели FastAPI
 class Question(BaseModel):
     question: str
     answer_type: str
@@ -88,82 +88,13 @@ class ReportData(BaseModel):
     questions_text: str
     list_about_questions: list[str]
 
-
-
-async def llama_request_async(prompt, max_token=None):
-    url = 'http://172.17.0.3:11434/api/chat'
-
-    payload = {
-        "model": "llama3.1",
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        "stream": False,
-        "max_token": max_token
-    }
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload) as response:
-            result = await response.json()
-            return result['message']['content']
-
-async def llama_create_schedule_async(formatted_text):
-    prompt = """
-    На основе приведенных пар вопросов и ответов составь основную информацию для временной шкалы В ТЕЧЕНИЕ ДНЯ ПРОИШЕСТВИЯ. Раздели ее на отдельные процессы, группируя события в логические цепочки. Каждый процесс должен включать этапы, события или действия, которые можно объединить по смыслу. Укажите время и кратко опишите содержание каждого этапа
-   
-    Вот текст: 
-    '''
-    {result}
-    '''
-    """
-
-    prompt = prompt.format(result=formatted_text)
-    result = await llama_request_async(prompt)
-
-    prompt = """
-    На основе этой выдержки сделай мне json структуру для временной шкалы по формату:
-    Строгий шаблон JSON-ответа:
-
-    {{
-        "process1": {{
-            "10:00-12:00": "Описание события 1, относящегося к process1.", // формат HH:MM обязателен везде
-            "12:00-13:00": "Описание события 2, относящегося к process1."
-        }},
-        "process2": {{
-            "09:00-11:00": "Описание события 1, относящегося к process2.",
-            "11:00-13:00": "Описание события 2, относящегося к process2."
-        }}
-    }}
-
-    Используйте приведенные ниже данные для составления временной шкалы:\n
-    '''
-    {text}
-    '''
-
-    В ответе нужен только JSON внутри блока кода (тройные кавычки):
-    ```json
-    ...
-    ```
-    \n
-    В json используй двойные кавычки!
-    """
-
-    prompt = prompt.format(text=result)
-    result = await llama_request_async(prompt)
-
-    return result
-
-
+class IsLastRespondentRequest(BaseModel):
+    is_last_respondent: bool
 
 # Функции работы с лламой
 @lru_cache(maxsize=512)
-def llama_request(prompt, max_token=None):
-    # URL вашего сервера
+def llama_request(prompt, max_token=None, max_retries=3, delay=2):
     url = 'http://172.17.0.3:11434/api/chat'
-
     payload = {
         "model": "llama3.1",
         "messages": [
@@ -176,18 +107,19 @@ def llama_request(prompt, max_token=None):
         "max_token": max_token
     }
 
-    # Отправка POST-запроса
-    response = requests.post(
-        url,
-        data=json.dumps(payload)
-    )
-
-    print(response.json()['message']['content'])
-    return response.json()['message']['content']
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(url, data=json.dumps(payload))
+            response.raise_for_status()  # Проверка на ошибки HTTP
+            return response.json()['message']['content']
+        except (requests.RequestException, KeyError, json.JSONDecodeError) as e:
+            print(f"Attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+            else:
+                raise HTTPException(status_code=500, detail=f"Failed to get response from LLaMA after {max_retries} attempts")
 
 def llama_create_schedule(formatted_text):
-    print('вход в llama_create_scedule: ', formatted_text)
-
     prompt = """
     На основе приведенных пар вопросов и ответов составь основную информацию для временной шкалы в день происшествия. Раздели информацию на логические процессы, группируя события в смысловые цепочки. 
 
@@ -200,7 +132,6 @@ def llama_create_schedule(formatted_text):
     {result}
     '''
     """
-
     prompt = prompt.format(result=formatted_text)
     result = llama_request(prompt)
 
@@ -232,24 +163,18 @@ def llama_create_schedule(formatted_text):
     Ответ должен быть в формате JSON внутри блока кода:
     ```json
     ...
-
     """
-
     prompt = prompt.format(text=result)
     result = llama_request(prompt)
 
-    # Проверка и исправление формата JSON
     try:
         json_data = json.loads(result)
     except json.decoder.JSONDecodeError:
-        # Исправление формата с использованием регулярных выражений
         result = extract_json_object(result)
-        result = re.sub(r"'", '"', result)  # Преобразование одинарных кавычек в двойные
-        #result = re.sub(r'(\d{2}:\d{2})', r'"\1"', result)  # Добавление кавычек к времени
+        result = re.sub(r"'", '"', result)
         json_data = json.loads(result)
 
     result = json.dumps(json_data)
-
     return result
 
 def llama_create_isikava(formatted_text):
@@ -261,7 +186,6 @@ def llama_create_isikava(formatted_text):
     {text}
     '''
     """
-
     prompt = prompt.format(text=formatted_text)
     result = llama_request(prompt)
 
@@ -311,26 +235,18 @@ def llama_create_isikava(formatted_text):
     ```
     В json используй двойные кавычки!
     """
-
     prompt = prompt.format(text=result)
     result = llama_request(prompt)
 
-    # Проверка и исправление формата JSON
     try:
         json_data = json.loads(result)
     except json.decoder.JSONDecodeError:
-        # Исправление формата с использованием регулярных выражений
         result = extract_json_object(result)
-        result = re.sub(r"'", '"', result)  # Преобразование одинарных кавычек в двойные
-        #result = re.sub(r'(\d{2}:\d{2})', r'"\1"', result)  # Добавление кавычек к времени
+        result = re.sub(r"'", '"', result)
         json_data = json.loads(result)
 
-
     result = json.dumps(json_data)
-
     return result
-
-
 
 # Функции для визуализации
 def save_isikava_image(data, filename):
@@ -348,54 +264,40 @@ def save_timeline_image(data, filename):
     return image_path
 
 def draw_isikava(data):
-    # Извлекаем основную проблему
     main_problem = data['main_problem']
-
-    # Извлекаем ветви и причины
     branches = data['branches']
     num_branches = len(branches)
-
-    # Находим максимальное количество причин
     max_causes = max(len(branch['reasons']) for branch in branches)
 
-    # Настраиваем размер фигуры в зависимости от данных
     fig_width = 14
     fig_height = max(6, num_branches * 2)
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
     ax.axis('off')
-
-    # Добавляем фон
     ax.set_facecolor('#f0f8ff')
 
-    # Рисуем основной хребет с градиентом
     spine_length = 20
     ax.plot([0, spine_length], [0, 0], color='#1f4e79', linewidth=4, solid_capstyle='round')
 
-    # Обводим основную проблему в стильную рамку
     wrapped_main_problem = textwrap.fill(main_problem, width=30)
     bbox_props = dict(boxstyle="round,pad=1", fc="#add8e6", ec="#1f4e79", lw=2)
     ax.text(spine_length, 0, wrapped_main_problem, fontsize=10, fontweight='bold',
             va='center', ha='left', bbox=bbox_props, color='#1f4e79')
 
-    # Рисуем хвост рыбы с более детальным дизайном
     tail = Polygon([[-1, -0.5], [0, 0], [-1, 0.5]], closed=True, fc='#1f4e79', ec='#1f4e79')
     ax.add_patch(tail)
 
-    # Цветовая палитра для ветвей
     colors = ['#87ceeb', '#4682b4', '#5f9ea0', '#b0c4de', '#add8e6']
 
-    # Позиции ветвей вдоль хребта
     branch_x_positions = np.linspace(spine_length * 0.1, spine_length * 0.9, num_branches)
 
     for i, branch in enumerate(branches):
         branch_name = branch['name']
         causes = branch['reasons']
         branch_x = branch_x_positions[i]
-        branch_color = colors[i % len(colors)]  # Применяем цвет к ветви
+        branch_color = colors[i % len(colors)]
 
-        # Определяем, рисовать ли ветвь вверх или вниз
         if i % 2 == 0:
-            branch_y = 4 + len(causes)  # Делаем пространство для причин
+            branch_y = 4 + len(causes)
             y_direction = 1
             valign = 'bottom'
         else:
@@ -403,26 +305,22 @@ def draw_isikava(data):
             y_direction = -1
             valign = 'top'
 
-        # Рисуем линию ветви с более толстым стилем и стрелкой
         arrow = FancyArrowPatch((branch_x, 0), (branch_x, branch_y), arrowstyle='->',
                                 mutation_scale=20, linewidth=2, color=branch_color)
         ax.add_patch(arrow)
 
-        # Добавляем название ветви в рамку
         wrapped_branch_name = textwrap.fill(branch_name, width=20)
         bbox_branch = dict(boxstyle="round,pad=0.5", fc="#f0f8ff", ec=branch_color, lw=2)
         ax.text(branch_x, branch_y + y_direction * 0.5, wrapped_branch_name, fontsize=12,
                 va=valign, ha='center', fontweight='bold', color=branch_color, bbox=bbox_branch)
 
-        # Рисуем причины вдоль ветви с более стильным оформлением
         num_causes = len(causes)
-        cause_positions = np.linspace(0, branch_y, num_causes + 2)[1:-1]  # исключаем начальную и конечную точки
+        cause_positions = np.linspace(0, branch_y, num_causes + 2)[1:-1]
 
         for j, cause in enumerate(causes):
             cause_x = branch_x
             cause_y = cause_positions[j]
-            # Рисуем линию причины, отклоняющуюся влево
-            cause_line_length = 3  # длина линии причины
+            cause_line_length = 3
             angle = np.degrees(np.arctan2(cause_y, cause_line_length))
             if y_direction > 0:
                 end_x = cause_x - cause_line_length * np.cos(np.radians(15))
@@ -433,7 +331,6 @@ def draw_isikava(data):
 
             ax.plot([cause_x, end_x], [cause_y, end_y], color=branch_color, linewidth=2)
 
-            # Добавляем текст причины в рамке
             wrapped_cause = textwrap.fill(cause, width=30)
             bbox_props_cause = dict(boxstyle="round,pad=0.3", fc="#fffacd", ec=branch_color, lw=1.5)
             ax.text(end_x - 0.5, end_y, wrapped_cause, fontsize=7, va='center',
@@ -450,7 +347,6 @@ def create_timeline(data):
     processes = list(data.keys())
     num_processes = len(processes)
     
-    # Собираем все временные метки и определяем общий временной диапазон
     all_times = set()
     for events in data.values():
         for time_interval in events.keys():
@@ -593,14 +489,12 @@ def create_timeline(data):
             )
     
     # Добавляем легенду
-    #custom_patches = [Rectangle((0,0),1,1, facecolor=color, edgecolor='#1f4e79') for color in event_colors]
-    #legend_labels = ['Слой {}'.format(i+1) for i in range(len(event_colors))]
-    #ax.legend(custom_patches, legend_labels, loc='upper right', fontsize=8, title='Слои событий', title_fontsize=9)
+    custom_patches = [Rectangle((0,0),1,1, facecolor=color, edgecolor='#1f4e79') for color in event_colors]
+    legend_labels = ['Слой {}'.format(i+1) for i in range(len(event_colors))]
+    ax.legend(custom_patches, legend_labels, loc='upper right', fontsize=8, title='Слои событий', title_fontsize=9)
     
     plt.tight_layout()
     #plt.show()
-
-
 
 # Заполнение отчета по вопросам
 @app.post("/api/fill_report")
@@ -663,7 +557,6 @@ async def fill_report(data: ReportData):
 
     return StreamingResponse(file_stream, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", headers=headers)
 
-
 # Генерация json-структур по ответам
 @app.post('/api/create-schedule')
 def create_schedule(text: FormattedText):
@@ -676,12 +569,10 @@ def create_isikava(text: FormattedText):
     return {'isikava': json_data}
 
 def extract_json_object(s):
-    # Находим все символы между первой "{" и последней "}"
     match = re.search(r'\{.*\}', s, re.DOTALL)
     if match:
         return match.group(0)
     return None
-
 
 # Генерация изображений
 @app.post('/api/generate-ishikawa-image')
@@ -702,7 +593,6 @@ def generate_ishikawa_image(text: FormattedText):
 @app.post('/api/generate-timeline-image')
 def generate_timeline_image(text: FormattedText):
     try:
-        #json_data = llama_create_schedule(text.formatted_text)
         json_data = extract_json_object(text.formatted_text)
         data = json.loads(json_data)
 
@@ -714,7 +604,6 @@ def generate_timeline_image(text: FormattedText):
         print(str(e))
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # Endpoint to choose an option from list with llama model launched locally
 @app.post("/api/choose-option")
@@ -731,8 +620,6 @@ def choose_option(request: OptionRequest):
         prompt += f"{option} - {options[option]['title']}\n"
      
     prompt += "\nВерни мне только номер/цифру выбранного тобой варианта. Если ты не можешь отнести ответ не к одному из предложенных вариатов (ответ настолько неоднозначен), то пожалуйста ответь числом '0'"
-
-    # return 0
 
     max_attempts = 3
     attempts = 0
@@ -757,16 +644,22 @@ def get_questions(question_id: str):
 
     print(branch, sheet, block, question_num)
 
-    return questions_all[branch][sheet][block][question_num]
+    question = questions_all[branch][sheet][block][question_num]
 
+    # Если это вопрос о последнем респонденте, добавляем флаг для фронтенда
+    if question['question'] == "Вы последний опрашиваемый по данному идентификатору?":
+        question['is_last_respondent_question'] = True
 
-# FastAPI маршрут для приема и сохранения ответов
+    return question
+
 @app.post("/api/submit-answers")
 def submit_answers(answers: Answers):
     try:
         print("Saving answers")
-        # Данные автоматически валидируются с помощью Pydantic
         validated_answers = answers.dict()
+
+        # Проверяем, является ли пользователь последним респондентом
+        is_last_respondent = any(answer['question'] == 'Вы последний опрашиваемый по данному идентификатору?' and answer['answer_option'] == 'да' for answer in validated_answers['questions'])
 
         formatted_text = ""
         for x in validated_answers['questions']:
@@ -785,12 +678,30 @@ def submit_answers(answers: Answers):
         new_log_entry = AnswerLog(
             answers_text=formatted_text,
             start_time=validated_answers["start_time"],
-            end_time=validated_answers["end_time"]
+            end_time=validated_answers["end_time"],
+            is_last_respondent=is_last_respondent
         )
         db.add(new_log_entry)
         db.commit()
         db.refresh(new_log_entry)
         db.close()
+
+        # Если пользователь последний респондент, генерируем отчеты и диаграммы
+        if is_last_respondent:
+            # Генерация временной шкалы
+            timeline_data = llama_create_schedule(formatted_text)
+            timeline_image_path = save_timeline_image(json.loads(timeline_data), "timeline.png")
+
+            # Генерация диаграммы Исикавы
+            isikava_data = llama_create_isikava(formatted_text)
+            isikava_image_path = save_isikava_image(json.loads(isikava_data), "isikava_diagram.png")
+
+            # Возвращаем ссылки на сгенерированные изображения
+            return {
+                "message": "Answers received and saved successfully.",
+                "timeline_image": timeline_image_path,
+                "isikava_image": isikava_image_path
+            }
 
         return {"message": "Answers received and saved successfully."}
 
@@ -798,8 +709,6 @@ def submit_answers(answers: Answers):
         # Перехват исключений и вывод ошибки
         raise HTTPException(status_code=422, detail=f"Ошибка при обработке данных: {str(e)}")
 
-
-# Форматирование ответов пользователя
 @app.post('/api/format-answers')
 def format_answers(answers: Answers):
     try:
@@ -824,8 +733,25 @@ def format_answers(answers: Answers):
         # Перехват исключений и вывод ошибки
         raise HTTPException(status_code=422, detail=f"Ошибка при обработке данных: {str(e)}")
 
+@app.post("/api/set-last-respondent")
+def set_last_respondent(request: IsLastRespondentRequest):
+    try:
+        # Здесь можно добавить логику для сохранения информации о том, является ли пользователь последним респондентом
+        # Например, сохранение в базу данных или файл
+        print(f"Is last respondent: {request.is_last_respondent}")
+        return {"message": "Last respondent status received and saved successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка при обработке данных: {str(e)}")
 
-
+@app.get("/api/get-last-respondent-status")
+def get_last_respondent_status():
+    try:
+        # Здесь можно добавить логику для получения информации о том, является ли пользователь последним респондентом
+        # Например, чтение из базы данных или файла
+        # В данном примере просто возвращаем фиктивное значение
+        return {"is_last_respondent": False}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка при обработке данных: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
